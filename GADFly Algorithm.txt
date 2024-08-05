@@ -1,0 +1,2174 @@
+USE [GADFly]
+GO
+
+/****** Object:  StoredProcedure [Alg].[uspPopulation_Create]    Script Date: 05/08/2024 11:19:01 ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+/*
+===================================================================================================
+Author:			Simon Poulton
+Create date:	20/12/2017
+Description:	Creates a new population and returns its ID.
+Amend Date:		28/02/2018
+Description:	I have inserted a new sub-routine here to allow balancing of the target-true/
+				target-false subgroups in the true temp table (#tblDataCrosstab) initialised in 
+				BE.[uspDataCrosstab_Initialise].  This takes an analysis parameter (TargetBalancing) 
+				which lies between 0 and 1, where 0 represents no balancing so all filtered records 
+				are included, and 1 where the balancing is perfect.  An intermediate value means  
+				that if there are end-groups that have some variation, a degree of balancing can be
+				achieved, without reducing the dataset completely to twice the smallest group.
+				Note that the sample is rebalanced for every population.
+Amend Date:		01/03/2018
+Description:	I have created a new input parameter which is a toggle between between real and
+				randomised data.  It is used in the balancing sub-routine described above.  It is 
+				also provided to the insert statement as a third variable and passed to 
+				uspGenome_Score as a new parameter. 
+Amend Date:		08/09/2020
+Description:	altered @bytCode to @intCode to allow > 255 populations.
+===================================================================================================
+*/
+CREATE PROCEDURE [Alg].[uspPopulation_Create] 
+	@intAnalysisID int,							-- passed to uspGenome_Create
+	@intDiscriminationID int,					-- Used locally to return the next population code
+	@blnRandomPop as bit,						-- Flag to indicate population is based on random target.
+	@tblAnalysis as Alg.udttConfig READONLY		-- Holds analysis parameters
+AS
+BEGIN
+	SET NOCOUNT ON;
+
+	-- **** DECLARATIONS & INITIALISATIONS ********************************************************
+	-- Local variables for balancing routine
+	DECLARE @fltBalance as float,
+			@fltTarget0 as float,
+			@fltTarget1 as float,
+			@intBalanceRecords as int,
+			@strSQL as varchar(max),
+			@strTarget as varchar(20),
+			@strTargetGroupSmall as varchar(1),
+			@strTargetGroupLarge as varchar(1);
+	
+	-- Declare local variables for control of flow.
+	DECLARE @intCode as smallint,				-- The next available population code - used locally.
+			@intPopulationID as int,			-- The ID of the population created here - passed on.
+			@bytNewGenomes as tinyint,			-- Number of new genomes to create
+			@bytGenomeCounter as tinyint = 1,	-- Counter for genome loop.
+			@intGenomeID as int;				-- Unique ID for the genome.
+			
+	-- Declare variables used for scoring the genome.
+	DECLARE	@fltGenePenalty as float,			-- Constant for analysis, passed to uspGenomeScore.
+			@fltCodonPenalty as float;			-- Constant for analysis, passed to uspGenomeScore.
+
+	-- Initialise the local variables.
+	SELECT @fltBalance = fldValue/100 FROM @tblAnalysis WHERE fldText = 'Target Balancing';
+	SELECT @fltGenePenalty = fldValue/1000 FROM @tblAnalysis WHERE fldText = 'Gene Penalty';
+	SELECT @fltCodonPenalty = fldValue/1000 FROM @tblAnalysis WHERE fldText = 'Codon Penalty';
+	-- **** END OF DECLARATIONS & INITIALISATIONS *************************************************
+
+	-- **** BALANCING ROUTINE *********************************************************************
+	-- first use dynamic SQL to get the counts of target-false and target-true (using the target
+	-- defined by @blnRandomPop. 
+	CREATE TABLE #tbl (fldTarget bit, fldN int);
+	SET @strTarget = 'fldTarget' + CASE WHEN @blnRandomPop = 0 THEN '' ELSE 'Random' END;
+	SET @strSQL = 'INSERT INTO #tbl SELECT ' + @strTarget + ', COUNT(fldValueID) 
+		FROM #tblDataCrosstab GROUP BY ' + @strTarget + ';';
+	EXEC (@strSQL);
+	SELECT @fltTarget0 = fldN FROM #tbl WHERE fldTarget = 0;
+	SELECT @fltTarget1 = fldN FROM #tbl WHERE fldTarget = 1;
+	
+	-- Now use these values to get the number of balance records
+	IF @fltTarget0 > @fltTarget1
+	BEGIN
+		SET @intBalanceRecords = CAST( @fltTarget1 + ((@fltTarget0 - @fltTarget1) * (1 - @fltBalance)) as int);
+		SELECT @strTargetGroupSmall = '1', @strTargetGroupLarge = '0';
+	END;
+	ELSE
+	BEGIN
+		SET @intBalanceRecords = CAST( @fltTarget0 + ((@fltTarget1 - @fltTarget0) * (1 - @fltBalance)) as int);
+		SELECT @strTargetGroupSmall = '0', @strTargetGroupLarge = '1';
+	END;
+
+	-- Now use dynamic SQL to set fldBalance to 1 for the small target group
+	-- and fldRandom for the larger target group.
+	SET @strSQL = '
+		UPDATE #tblDataCrosstab SET fldBalance = NULL, fldRandom = NULL; 
+		UPDATE #tblDataCrosstab SET fldBalance = 1 
+			WHERE ' + @strTarget + ' = ' + @strTargetGroupSmall + ';
+		UPDATE #tblDataCrosstab SET fldRandom = RAND(CAST(NEWID() as varbinary)) 
+			WHERE ' + @strTarget + ' = ' + @strTargetGroupLarge + ';';
+	EXEC (@strSQL);
+
+	-- Finally set fldBalance in the top N random records in the larger target group to 1.
+	SET @strSQL = '
+		WITH FirstPass AS (
+			SELECT TOP ' + CAST(@intBalanceRecords as varchar(10)) 
+			+ ' * FROM #tblDataCrosstab ORDER BY fldRandom DESC)
+			UPDATE FirstPass SET fldBalance = 1;';
+	EXEC (@strSQL);
+
+--drop table Test.tblDataCrosstab;
+--select * into Test.tblDataCrosstab from #tblDataCrosstab;
+	-- **** END OF BALANCING ROUTINE **************************************************************
+
+	-- **** POPULATION CREATION *******************************************************************
+	-- If blnRandomPop = 0 then get the next available population code, otherwise keep the same.
+	SELECT @intCode = ISNULL(MAX(fldCode), 0) + ABS(CAST(@blnRandomPop as tinyint) - 1) 
+		FROM BE.tblPopulation WHERE fldDiscriminationID = @intDiscriminationID;
+
+	-- Use this to insert a new record and return its ID
+	INSERT INTO BE.tblPopulation (fldDiscriminationID, fldCode, fldRandom)
+		VALUES(@intDiscriminationID, @intCode, @blnRandomPop);
+	SET @intPopulationID = SCOPE_IDENTITY();
+
+	-- Now create the system-specified number of new genomes for this population for generation = 0.
+	--SELECT @bytNewGenomes = fldValue FROM @tblAnalysis WHERE fldText = 'New Genomes';
+	SELECT @bytNewGenomes = fldValue FROM @tblAnalysis WHERE fldText = 'Breeding Pop';
+	WHILE @bytGenomeCounter <= @bytNewGenomes
+	BEGIN
+		-- Call the Genome_Create procedure to create a new genome in the temp table hierarchy
+		EXEC @intGenomeID = Alg.uspGenome_Create 
+							@intAnalysisID, @intPopulationID, 0, @bytGenomeCounter, 1, @tblAnalysis;
+
+		-- Finally score the genome by calling uspGenome_Score with the scope parameter set to breeding.
+		EXEC Alg.uspGenome_Score @intAnalysisID, @intGenomeID, @fltGenePenalty, @fltCodonPenalty, @blnRandomPop;
+
+		SET @bytGenomeCounter += 1;
+	END
+
+	RETURN @intPopulationID;
+END
+
+
+	--IF @fltTarget0 > @fltTarget1
+	--BEGIN
+	--	SET @intBalanceRecords = CAST( @fltTarget1 + ((@fltTarget0 - @fltTarget1) * (1 - @fltBalance)) as int);
+	--	UPDATE #tblDataCrosstab SET fldBalance = 1 WHERE fldTarget = 1;
+	--	UPDATE #tblDataCrosstab SET fldRandom = RAND(CAST(NEWID() as varbinary)) WHERE fldTarget = 0;
+	--END;
+	--ELSE
+	--BEGIN
+	--	SET @intBalanceRecords = CAST( @fltTarget0 + ((@fltTarget1 - @fltTarget0) * (1 - @fltBalance)) as int);
+	--	UPDATE #tblDataCrosstab SET fldBalance = 1 WHERE fldTarget = 0;
+	--	UPDATE #tblDataCrosstab SET fldRandom = RAND(CAST(NEWID() as varbinary)) WHERE fldTarget = 1;
+	--END;
+GO
+
+/****** Object:  StoredProcedure [Alg].[uspPopulation_Evolve]    Script Date: 05/08/2024 11:19:01 ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+/*
+=============================================================================================================
+Author:			Simon Poulton
+Create date:	22/12/2016
+Description:	Evolves a new generation from the existing breeding population. This proc controls the 
+				breeding within a single generation.  It extracts the breeding population into three tables;
+				a)	@tmpBreedingGenome - a local table variable that just holds the IDs of the genomes,
+				b)	Alg.tmpBreedingGene - a process-keyed table (with AnalysisID as the processID) and,
+				c)	Alg.tmpBreedingCodon - ditto.
+				Then it creates a cursor of all the breeding genomes and loops through it.  Within each loop
+				it carries out three main tasks;
+				a)	it creates a new genome and stores it in the permanent table,
+				b)	it evolves the existing genome in some way and stores the genes and codons in the 
+					permanent tables and,
+				c)	it scores the genome.
+============================================================================================================
+*/
+CREATE PROCEDURE [Alg].[uspPopulation_Evolve] 
+	@intAnalysisID int,							-- Used for all called procs.
+	@intPopulationID int,						-- Used locally.
+	@intGeneration smallint,					-- Code for current generation, just used for the record insertion 
+	@blnRandomPop bit,							-- Flag to indicate population is based on random target.
+	@tblAnalysis as Alg.udttConfig READONLY		-- Holds analysis parameters
+AS
+BEGIN
+	SET NOCOUNT ON;
+
+	-- Declare the local variables used in the analysis
+	DECLARE 
+			@bytBreedingPop tinyint,		-- Number of genomes in the breeding population.
+			@fltGenePenalty float,			-- Passed to the uspGenome_Score procedure.
+			@fltCodonPenalty float,			-- Passed to the uspGenome_Score procedure.
+			@intGenomeID as int,			-- Used in the breeding genome cursor and passed to several procs.
+			@strLevel as nvarchar(6),		-- The level at which the evolutionary action will take place.
+			@intNewGenomeID int,			-- Holds the ID of the new genome created within the cursor.
+			@bytGenomeCode tinyint = 1,		-- Next available genome code.
+			@bytGenes as tinyint,			-- Number of genes created by call to uspGenome_Create.
+			@bytCodons as tinyint;			-- Number of codons created by call to uspGenome_Create.  
+
+	-- First get the local variables
+	SELECT @bytBreedingPop = fldValue FROM @tblAnalysis WHERE fldText = 'Breeding Pop';
+	SELECT @fltGenePenalty = (fldValue / 1000) FROM @tblAnalysis WHERE fldText = 'Gene Penalty';
+	SELECT @fltCodonPenalty = (fldValue / 1000) FROM @tblAnalysis WHERE fldText = 'Codon Penalty';
+	
+	-- Now reset the breeding flag in tmpGenome to mark the top N scoring genomes
+	-- Use a CTE to get only one genome per score, which prevents it being dominated by in-breeding.
+	UPDATE Alg.tmpGenome SET fldBreeding = 0 WHERE fldPopulationID = @intPopulationID;
+	WITH FirstPass AS (
+			SELECT DISTINCT TOP (@bytBreedingPop) fldScore 
+				FROM Alg.tmpGenome
+				WHERE (fldPopulationID = @intPopulationID) 
+				ORDER BY fldScore DESC),
+		SecondPass AS (
+			SELECT MIN(G.fldID) AS fldID
+				FROM Alg.tmpGenome AS G
+					INNER JOIN FirstPass AS FP	
+						ON G.fldScore = FP.fldScore 
+				GROUP BY G.fldScore)
+		UPDATE G SET fldBreeding = 1
+			FROM Alg.tmpGenome AS G
+			INNER JOIN SecondPass AS SP
+				ON G.fldID = SP.fldID;
+
+	-- Create a cursor of these genomes 
+	DECLARE csrBreedingGenomes CURSOR FAST_FORWARD FOR 	
+		SELECT fldID FROM Alg.tvfBreedingGenomes(@intPopulationID);
+	
+	OPEN csrBreedingGenomes;
+	FETCH NEXT FROM csrBreedingGenomes INTO @intGenomeID;
+	WHILE @@FETCH_STATUS = 0
+	-- Loop through the genomes in the breeding population, carrying out an evolution on each one in turn.
+	BEGIN
+		-- First get the level at which this evolution will take place.
+		SELECT @strLevel = Alg.svfGetRandomMutation(@tblAnalysis, 'Level', RAND(), 0, 0, 0);
+
+		IF @strLevel = 'Genome'
+		-- Create an entirely new genome
+		BEGIN
+			EXEC @intNewGenomeID = Alg.uspGenome_Create 
+					@intAnalysisID, @intPopulationID, @intGeneration, @bytGenomeCode, 1, @tblAnalysis;
+		END
+
+		IF @strLevel <> 'Genome'
+		-- If the level is Gene or Codon, create a new blank genome record in tmpGenome and
+		-- then evolve it by calling uspGenome_Evolve
+		BEGIN
+			EXEC @intNewGenomeID = Alg.uspGenome_Create 
+					@intAnalysisID, @intPopulationID, @intGeneration, @bytGenomeCode, 0, @tblAnalysis;
+			EXEC Alg.uspGenome_Evolve 
+					@intAnalysisID, @intPopulationID, @intGenomeID, @intNewGenomeID, @strLevel, @tblAnalysis;
+		END
+
+		-- Finally score the genome by calling uspGenome_Score with the scope parameter set to breeding.
+		EXEC Alg.uspGenome_Score @intAnalysisID, @intNewGenomeID, @fltGenePenalty, @fltCodonPenalty, @blnRandomPop;
+
+		SET @bytGenomeCode +=1;
+		FETCH NEXT FROM csrBreedingGenomes INTO @intGenomeID;
+	END
+	CLOSE csrBreedingGenomes;
+	DEALLOCATE csrBreedingGenomes;
+
+END
+GO
+
+/****** Object:  StoredProcedure [Alg].[uspGenome_Score]    Script Date: 05/08/2024 11:19:01 ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+/*
+===================================================================================================
+Author:			Simon Poulton
+Create date:	20/12/2017
+Description:	This proc encapsulates the call to Alg.tvfGetGenomeScores with its parameters and
+				stores the Phi coefficient in tmpGenome. 
+Amend Date:		01/03/2018
+Description:	New input parameter indicating whether the population uses random target records, 
+				which is passed down to uspGenome_Evaluate.
+===================================================================================================
+*/
+CREATE PROCEDURE [Alg].[uspGenome_Score] 
+	@intAnalysisID int,
+	@intGenomeID int,
+	@fltGenePenalty float,
+	@fltCodonPenalty float,
+	@blnRandomPop bit						
+AS
+BEGIN
+	SET NOCOUNT ON;
+
+	-- **** DECLARATIONS **************************************************************************
+	DECLARE @tblTally as Alg.udttGenomeScore;
+	
+	DECLARE @bytGenes as tinyint,				-- Number of genes created by call to uspGenome_Create.
+			@bytCodons as tinyint,				-- Number of codons created by call to uspGenome_Create.  	
+			@fltPhi as float;					-- Holds the phi coefficient.
+	-- **** END OF DECLARATIONS *******************************************************************
+
+	INSERT INTO @tblTally EXEC Alg.uspGenome_Evaluate @intAnalysisID, @intGenomeID, @blnRandomPop;
+
+	SELECT @bytGenes = COUNT(fldID) FROM Alg.tmpGene WHERE fldGenomeID = @intGenomeID;
+	SELECT @bytCodons = COUNT(G.fldID) 
+		FROM Alg.tmpGene AS G INNER JOIN Alg.tmpCodon AS C ON G.fldID = C.fldGeneID 
+		WHERE G.fldGenomeID = @intGenomeID;
+
+	-- Finally score the tally by calling tvfGetGenomeScores and save this value in tmpGenome.
+	-- Note use of TRY/CATCH to capture errors (e.g. divide by zero) in the function.
+	BEGIN try
+		SELECT @fltPhi = fldPhi FROM Alg.tvfGetGenomeScores(
+					@tblTally, 'Breeding', @bytGenes, @bytCodons, @fltGenePenalty, @fltCodonPenalty);
+	END TRY
+	BEGIN CATCH
+		SET @fltPhi = 0;
+	END CATCH
+
+	UPDATE Alg.tmpGenome SET fldScore = @fltPhi WHERE fldID = @intGenomeID;
+END
+GO
+
+/****** Object:  StoredProcedure [Alg].[uspGenome_Evolve]    Script Date: 05/08/2024 11:19:01 ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+/*
+===================================================================================================
+Author:			Simon Poulton
+Create date:	22/12/2016
+Description:	Takes the specified Genome and evolves it according to the action parameter. 
+===================================================================================================
+*/
+CREATE PROCEDURE [Alg].[uspGenome_Evolve] 
+	@intAnalysisID int,							-- Used for all called procs.
+	@intPopulationID int,						-- Used locally.
+	@intOldGenomeID as int,						-- ID of the old genome to be evolved from.
+	@intNewGenomeID as int,						-- ID of the New genome to be evolved into.
+	@strLevel nvarchar(5),						-- The level at which the evolutionary action will take place.
+	@tblAnalysis as Alg.udttConfig READONLY		-- Holds analysis parameters
+AS
+BEGIN
+	SET NOCOUNT ON;
+
+	-- Declare the local variables used in the analysis
+	DECLARE @bytCurrentGenes as tinyint,	-- Number of genes in the current genome.
+			@bytRandomGeneCode as tinyint,	-- Code of randomly selected gene within the current genome.
+			@bytCurrentCodons as tinyint,	-- Number of codons in the current gene.
+			@bytCodonCode as tinyint;		-- Code of randomly selected codon within the current gene.
+
+	-- First make a copy of the genes in the old genome into tmpGene.
+	INSERT INTO Alg.tmpGene (
+				fldGenomeID,
+				fldCode,
+				fldLogical,
+				fldLeft,
+				fldRight,
+				fldOrder,
+				fldComparison,
+				fldType) 
+		SELECT	@intNewGenomeID,
+				fldCode,
+				fldLogical,
+				fldLeft,
+				fldRight,
+				fldOrder,
+				fldComparison,
+				fldType
+			FROM Alg.tvfCurrentGenes(@intOldGenomeID); 
+	SET @bytCurrentGenes = @@ROWCOUNT; 
+		
+	-- And make a copy of all the codons in the genome into tmpCurrentCodon.
+	INSERT INTO Alg.tmpCodon(
+				fldGeneID,
+				fldCode,
+				fldLeft,
+				fldRight,
+				fldOrder,
+				fldArithmetic,
+				fldVariableID,
+				fldValueID)
+		SELECT	NG.fldID,
+				C.fldCode,
+				C.fldLeft,
+				C.fldRight,
+				C.fldOrder,
+				C.fldArithmetic,
+				C.fldVariableID,
+				C.fldValueID
+			FROM Alg.tmpCodon AS C
+			INNER JOIN (SELECT fldID, fldCode FROM Alg.tvfCurrentGenes(@intOldGenomeID) ) AS OG
+				ON C.fldGeneID = OG.fldID  
+			INNER JOIN (SELECT fldID, fldCode FROM Alg.tvfCurrentGenes(@intNewGenomeID) ) AS NG
+				ON OG.fldCode = NG.fldCode; 
+
+	IF @strLevel = 'Gene'
+		EXEC Alg.uspGene_Evolve @intAnalysisID, @intPopulationID, @intNewGenomeID, @tblAnalysis;
+	ELSE
+		EXEC Alg.uspCodon_Evolve @intAnalysisID, @intPopulationID, @intNewGenomeID, @tblAnalysis;
+END
+GO
+
+/****** Object:  StoredProcedure [Alg].[uspGenome_Evaluate]    Script Date: 05/08/2024 11:19:01 ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+/*
+=============================================================================================================
+Author:			Simon Poulton
+Create date:	20/12/2017
+Description:	Evaluates the current genome.  It uses the true temp table #tmpDataCrosstab, created in 
+				uspAnalysis_run and populated in uspDataCrosstab_Initialise, to evaluate the genome using a 
+				single expression created with dynamic SQL.  The SQL string takes the following format:
+				WITH FirstPass as (
+					SELECT fldTarget
+						,CASE WHEN Var2 is null THEN NULL ELSE case when Var2 > 70 then 1 else 0 end END AS Gene1 
+						,CASE WHEN Var3 is null THEN NULL ELSE case when Var3 > 80 then 1 else 0 end END AS Gene2 
+						, ... 
+						FROM #tblDataCrosstab
+					),
+					SecondPass as (
+					SELECT fldTarget,
+							(Gene1 & Gene2 | ...) AS fldPredictor 
+						FROM FirstPass 
+					)
+					SELECT	fldTarget, 
+							CASE WHEN fldPredictor IS NULL THEN -1 ELSE fldPredictor END, 
+							COUNT(fldTarget) AS fldN
+						FROM SecondPass
+						GROUP BY fldTarget, fldPredictor
+						ORDER BY fldTarget, fldPredictor;
+				The proc returns a table with three fields; fldTarget bit, fldPredictor bit, fldN int;
+Amend Date:		28/02/2018
+Description:	I have added an additional Where clause to the final SQL string for #tblDataCrosstab.  This
+				utilises the new fldBalance which has been initialised in uspPopulation_Create.
+Amend Date:		01/03/2018
+Description:	I have added an additional input parameter indicating whether the population uses random 
+				target records.  This modifies the final SQL evaluation expression to use fldTargetRandom
+				when true.
+=============================================================================================================
+*/
+CREATE PROCEDURE [Alg].[uspGenome_Evaluate] 
+	@intAnalysisID int,
+	@intGenomeID int,
+	@blnRandomPop bit
+AS
+BEGIN
+	SET NOCOUNT ON;
+	
+	DECLARE 
+			@intGeneID as int,
+			@bytGeneCode as tinyint,
+			@strComparison as nvarchar(2),
+			@strVariables as nvarchar(max) = '',
+			@strValues as nvarchar(max) = '',
+			@strGeneDefinitions as nvarchar(max) = '',
+			@strGeneConcatenations as nvarchar(max) = '',
+			@strSQL as nvarchar(max) = '',
+			@strError as nvarchar(max);
+
+	-- First declare a cursor to loop through the genes getting the code and comparison operator
+	DECLARE csr CURSOR FAST_FORWARD FOR
+		SELECT fldID, fldCode, fldComparison 
+			FROM Alg.tmpGene WHERE fldGenomeID = @intGenomeID ORDER BY fldOrder;
+	OPEN csr;
+	FETCH next FROM csr INTO @intGeneID, @bytGeneCode, @strComparison
+	WHILE @@FETCH_STATUS = 0
+	BEGIN
+		-- Concatenate the individual gene definitions
+		SET @strVariables = '';
+		SELECT @strVariables  
+				+= CASE WHEN C.fldOrder = 0 THEN '' ELSE C.fldArithmetic END + ' ' + fldLeft 
+				+ 'Var' +	CAST(V.fldID as nvarchar(10)) + CASE WHEN V.fldType = 4 THEN 'V' ELSE '' END
+				+ fldRight + ' ' 
+			FROM Alg.tmpCodon AS C
+				INNER JOIN Alg.tvfVariable(@intAnalysisID) AS V 
+					ON C.fldVariableID = V.fldID
+			WHERE C.fldGeneID = @intGeneID 
+			ORDER BY fldOrder; 
+		
+		-- Concatenate the individual value definitions
+		SET @strValues = '';
+		SELECT @strValues  
+				+= CASE WHEN C.fldOrder = 0 THEN '' ELSE C.fldArithmetic END + ' ' + fldLeft 
+				+ CASE WHEN V.fldType = 4 THEN VAL.fldText ELSE CAST(C.fldValueID as nvarchar(10)) END 
+				+ fldRight + ' ' 
+			FROM Alg.tmpCodon AS C
+				INNER JOIN Alg.tvfVariable(@intAnalysisID) AS V 
+					ON C.fldVariableID = V.fldID
+				INNER JOIN Alg.tvfValue(@intAnalysisID) AS VAL 
+					ON C.fldValueID = VAL.fldID 
+			WHERE C.fldGeneID = @intGeneID 
+			ORDER BY fldOrder; 
+
+		-- Combine these into a single expression and concatenate it with the previous gene definitions.
+		SELECT @strGeneDefinitions 
+			+= ', CASE WHEN ' + @strVariables + ' IS NULL THEN NULL ELSE '  
+			+ 'CASE WHEN ' + @strVariables + ' ' + @strComparison + ' ' + @strValues + ' THEN 1 ELSE 0 END '
+			+ 'END AS Gene' + CAST(@bytGeneCode AS nvarchar(10)); 
+
+		FETCH next FROM csr INTO @intGeneID, @bytGeneCode, @strComparison
+	END
+	CLOSE csr;
+	DEALLOCATE csr;
+
+	-- Now simply create the string for concatenating the genes together with the comparison operators.
+	SELECT @strGeneConcatenations += CASE WHEN fldOrder > 0 THEN fldLogical ELSE '' END
+			+ ' ' + fldLeft + ' Gene' + CAST(fldCode as nvarchar(10)) + ' ' + fldRight + ' '
+		FROM Alg.tmpGene 
+		WHERE fldGenomeID = @intGenomeID 
+		ORDER BY fldOrder;
+
+	-- Finally, compile the full SQL string and execute it
+	SET @strSQL = '
+		WITH FirstPass as (
+			SELECT fldTarget' + CASE WHEN @blnRandomPop = 1 THEN 'Random' ELSE '' END + ' AS fldTarget ' 
+				+ @strGeneDefinitions + '
+				FROM #tblDataCrosstab 
+				WHERE (fldTarget IS NOT NULL) AND (fldBalance = 1) ),
+		SecondPass as (
+			SELECT fldTarget, ' + @strGeneConcatenations + ' AS fldPredictor FROM FirstPass)
+		SELECT	fldTarget, 
+				CASE WHEN fldPredictor IS NULL THEN -1 ELSE fldPredictor END AS fldPredictor, 
+				COUNT(fldTarget) AS fldN
+			FROM SecondPass
+			GROUP BY fldTarget, fldPredictor
+			ORDER BY fldTarget, fldPredictor;';
+
+	BEGIN TRY
+		EXEC (@strSQL);
+	END TRY
+
+	BEGIN CATCH
+		-- If any error occurs in the evaluation ( maybe due to divide by zero error )
+		-- then just return an an empty table which will be dealt with by the calling proc.
+		SELECT 0 AS fldTarget, 0 AS fldPredictor, 0 AS fldN;
+	END CATCH
+END
+GO
+
+/****** Object:  StoredProcedure [Alg].[uspGenome_Create]    Script Date: 05/08/2024 11:19:01 ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+/*
+===================================================================================================
+Author:			Simon Poulton
+Create date:	20/12/2016
+Description:	Creates a brand new genome and returns the genomeID.  If @blnMakeGenes = 1,
+				i.e. the calling proc is uspPopulation_Create, then create the required number of   
+				genes for the specified genome, otherwise just return.
+===================================================================================================
+*/
+CREATE PROCEDURE [Alg].[uspGenome_Create] 
+	@intAnalysisID int,							-- Used in uspGene_Create and uspGenome_Score.
+	@intPopulationID int,						-- Used locally to get the next genome code.
+	@intGeneration smallint,					-- Ditto.
+	@bytGenomeCode as tinyint,					-- Unique code for the genome within the population.
+	@blnMakeGenes as bit,						-- Boolean flag to create new genes or just return the genome record.
+	@tblAnalysis as Alg.udttConfig READONLY		-- Holds analysis parameters
+AS
+BEGIN
+	SET NOCOUNT ON;
+
+	DECLARE 
+			@intGenomeID as int,			-- Unique ID for the genome - returned to the calling proc.
+			@bytMaxGenes tinyint = 0,		-- Used locally in the genome creation loop.
+			@bytGeneCode as tinyint = 1,	-- Counter for gene creation loop.
+			@fltNewGene as float,			-- Probability of a new gene being created within the loop.
+			@blnNewGene as bit = 1;			-- Boolean flag to control gene generation loop
+
+	-- First create the new genome record and save its ID.
+	INSERT INTO Alg.tmpGenome (
+				fldPopulationID, 
+				fldGeneration, 
+				fldCode)
+		VALUES(	@intPopulationID, 
+				@intGeneration, 
+				@bytGenomeCode);
+	SET @intGenomeID = SCOPE_IDENTITY();
+
+	IF @blnMakeGenes = 1
+	-- If true then create the required number of new genes, BUT test the value of 
+	-- @blnLastGene during each loop.  Within each loop it calls the uspGene_Create.
+	BEGIN
+		SELECT @bytMaxGenes = fldValue FROM @tblAnalysis WHERE fldText = 'Max Genes';
+		SELECT @fltNewGene = fldValue/100 FROM @tblAnalysis WHERE fldText = 'New Gene';
+		WHILE (@bytGeneCode <= @bytMaxGenes) AND (@blnNewGene = 1) 
+		BEGIN
+			EXEC Alg.uspGene_Create @intAnalysisID, @intGenomeID, @bytGeneCode, @tblAnalysis;
+		
+			-- Increment the gene code and test for a new gene.
+			SET @bytGeneCode += 1;
+			SET @blnNewGene = CASE WHEN RAND() < @fltNewGene THEN 1 ELSE 0 END;
+		END
+
+		-- Finally, bracket the genes in this genome
+		EXEC Alg.uspGene_Rebracket @intGenomeID;
+	END
+
+	RETURN @intGenomeID;
+END
+GO
+
+/****** Object:  StoredProcedure [Alg].[uspGeneRecord_Insert]    Script Date: 05/08/2024 11:19:01 ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+/*
+=============================================================================================================
+Author:			Simon Poulton
+Create date:	03/02/2018
+Description:	Evaluates the current genome for genes individually, storing the results in tblGeneRecord.  
+				It uses the same logic as uspGenome_Evaluate, but stores the result within each gene loop,
+				rather than concatenating at the end.
+=============================================================================================================
+*/
+CREATE PROCEDURE [Alg].[uspGeneRecord_Insert] 
+	@intAnalysisID int,
+	@intGenomeID int
+AS
+BEGIN
+	SET NOCOUNT ON;
+	
+	DECLARE 
+			@intGeneID as int,
+			@bytGeneCode as tinyint,
+			@strComparison as nvarchar(2),
+			@strVariables as nvarchar(max) = '',
+			@strValues as nvarchar(max) = '',
+			@strGeneDefinition as nvarchar(max) = '',
+			@strSQL as nvarchar(max) = '';
+
+	-- First declare a cursor to loop through the genes getting the code and comparison operator
+	DECLARE csr CURSOR FAST_FORWARD FOR
+		SELECT fldID, fldCode, fldComparison 
+			FROM BE.tblGene WHERE fldGenomeID = @intGenomeID ORDER BY fldOrder;
+	OPEN csr;
+	FETCH next FROM csr INTO @intGeneID, @bytGeneCode, @strComparison
+	WHILE @@FETCH_STATUS = 0
+	BEGIN
+		-- Concatenate the individual gene definitions
+		SET @strVariables = '';
+		SELECT @strVariables  
+				+= CASE WHEN C.fldOrder = 0 THEN '' ELSE C.fldArithmetic END + ' ' + fldLeft 
+				+ 'Var' +	CAST(V.fldID as nvarchar(10)) + CASE WHEN V.fldType = 4 THEN 'V' ELSE '' END
+				+ fldRight + ' ' 
+			FROM BE.tblCodon AS C
+				INNER JOIN BE.tblVariable AS V 
+					ON C.fldVariableID = V.fldID
+			WHERE C.fldGeneID = @intGeneID 
+			ORDER BY fldOrder; 
+		
+		-- Concatenate the individual value definitions
+		SET @strValues = '';
+		SELECT @strValues  
+				+= CASE WHEN C.fldOrder = 0 THEN '' ELSE C.fldArithmetic END + ' ' + fldLeft 
+				+ CASE WHEN V.fldType = 4 THEN VAL.fldText ELSE CAST(C.fldValueID as nvarchar(10)) END 
+				+ fldRight + ' ' 
+			FROM BE.tblCodon AS C
+				INNER JOIN BE.tblVariable AS V 
+					ON C.fldVariableID = V.fldID
+				INNER JOIN BE.tblValue AS VAL 
+					ON C.fldValueID = VAL.fldID 
+			WHERE C.fldGeneID = @intGeneID 
+			ORDER BY fldOrder; 
+
+		-- Combine these into a single expression for the gene definition.
+		SELECT @strGeneDefinition 
+			= ', CASE WHEN ' + @strVariables + ' IS NULL THEN NULL ELSE '  
+			+ 'CASE WHEN ' + @strVariables + ' ' + @strComparison + ' ' + @strValues + ' THEN 1 ELSE 0 END '
+			+ 'END AS fldGene'; -- + CAST(@bytGeneCode AS nvarchar(10)); 
+
+		-- Finally, compile the full SQL string and execute it
+		SET @strSQL = '
+			WITH FirstPass as (
+				SELECT fldRecordID ' + @strGeneDefinition + '
+					FROM #tblDataCrosstab WHERE fldTarget IS NOT NULL)
+			INSERT INTO BE.tblGeneRecord
+				SELECT ' + CAST(@intGeneID as nvarchar(10)) + ', fldRecordID, fldGene AS fldResult FROM FirstPass
+					WHERE fldGene IS NOT NULL;	';
+
+		BEGIN TRY
+			EXEC (@strSQL);
+		END TRY
+
+		BEGIN CATCH
+			-- If any error occurs in the evaluation ( maybe due to divide by zero error )
+			-- then just return an an empty table which will be dealt with by the calling proc.
+			SELECT 0 AS fldTarget, 0 AS fldPredictor, 0 AS fldN;
+		END CATCH
+
+		FETCH next FROM csr INTO @intGeneID, @bytGeneCode, @strComparison
+	END
+	CLOSE csr;
+	DEALLOCATE csr;
+END
+GO
+
+/****** Object:  StoredProcedure [Alg].[uspGene_Rebracket]    Script Date: 05/08/2024 11:19:01 ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+/*
+=======================================================================================================
+Author:			Simon Poulton
+Create date:	29/11/2016
+Description:	BRILLIANT CODING!!!
+				I've finally cracked how to specify and store the information required for
+				bracketing these expressions.  It is based on FIVE logical rules;
+				a)	there will always be n - 1 pairs of brackets.
+				b)	The count of all the left brackets must equal the count of all the right brackets.
+				c)	Any one term must have left or right brackets - not both or neither.
+				d	Any one term can have between zero and n - 1 brackets.
+				e)	The whole genome expression must begin with a term with left brackets and end
+					with a term with right brackets, but apart from this the terms can be in any order.
+=======================================================================================================
+*/
+CREATE PROCEDURE [Alg].[uspGene_Rebracket] 
+	@intGenomeID int				
+AS
+BEGIN
+	SET NOCOUNT ON;
+
+	DECLARE @bytRecords as tinyint,
+			@bytCode as tinyint,
+			@bytLefts as tinyint = 0,
+			@bytRights as tinyint = 0;
+
+	-- First get the number of gene records in the current genome.
+	SELECT @bytRecords = COUNT(fldCode) FROM Alg.tmpGene WHERE (fldGenomeID = @intGenomeID);
+
+	-- Clear the current genes of brackets and set the order to 255.
+	UPDATE Alg.tmpGene SET fldLeft = '', fldRight = '', fldOrder = 255
+		WHERE (fldGenomeID = @intGenomeID);
+
+	IF @bytRecords > 1
+	-- Only add brackets if more than one record
+	BEGIN
+		-- Add n-1 left brackets randomly to the records
+		WHILE @bytLefts < (@bytRecords - 1)
+		BEGIN
+			SET @bytCode = Alg.svfGetRandomCode(RAND(), @bytRecords)
+		
+			UPDATE Alg.tmpGene 
+				SET fldLeft += '(', fldOrder = CASE WHEN @bytLefts = 0 THEN 0 ELSE fldOrder END
+				WHERE (fldGenomeID = @intGenomeID) AND (fldCode = @bytCode);
+			SET @bytLefts += 1;
+		END
+
+		-- Now add one right bracket to all records with no left brackets and count them.
+		UPDATE Alg.tmpGene SET fldRight += ')'
+			 WHERE (fldGenomeID = @intGenomeID) AND (fldLeft = '');
+		SET @bytRights = @@ROWCOUNT;
+
+		-- Finally, randomly add the remaining rights (up to n-1) to records with no lefts.
+		WHILE @bytRights < (@bytRecords - 1) 
+		BEGIN
+			SET @bytCode = Alg.svfGetRandomCode(RAND(), @bytRecords)
+
+			-- Test to ensure that only records with no lefts are selected.
+			IF (SELECT fldLeft FROM Alg.tmpGene 
+				WHERE (fldGenomeID = @intGenomeID) AND (fldCode = @bytCode)) = '' 
+			BEGIN
+				UPDATE Alg.tmpGene 
+					SET fldRight += ')', fldOrder = CASE WHEN @bytRights = (@bytRecords - 2) THEN @bytRecords - 1 ELSE fldOrder END
+					WHERE (fldGenomeID = @intGenomeID) AND (fldCode = @bytCode);
+				SET @bytRights += 1;
+			END;
+		END;
+
+		-- Finally, randomly sort the remaining records (still coded 255) and recode them from 1 to records-1
+		WITH FirstPass AS (
+		SELECT fldCode, (ROW_NUMBER() OVER (ORDER BY NEWID())) AS fldRN 
+			FROM Alg.tmpGene WHERE (fldGenomeID = @intGenomeID) AND (fldOrder = 255) )
+		UPDATE G
+			SET fldOrder = fldRN
+			FROM FirstPass AS FP INNER JOIN Alg.tmpGene AS G
+				ON FP.fldCode = G.fldCode
+			WHERE G.fldGenomeID = @intGenomeID; 
+	END
+	-- Just set the order to zero for evaluation.
+	ELSE
+	BEGIN
+		UPDATE Alg.tmpGene SET fldOrder = 0 WHERE (fldGenomeID = @intGenomeID);
+	END
+END
+GO
+
+/****** Object:  StoredProcedure [Alg].[uspGene_Evolve]    Script Date: 05/08/2024 11:19:01 ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+/*
+===================================================================================================
+Author:			Simon Poulton
+Create date:	23/12/2016
+Description:	Takes the specified Genome, and evolves it according to a random mutation.   
+				Note that if this is explicitly 'Rebracket' or one of the first three in the list, 
+				then it calls the Rebracket proc.  It does not do this for the logical and 
+				comparison mutations.
+===================================================================================================
+*/
+CREATE PROCEDURE [Alg].[uspGene_Evolve] 
+	@intAnalysisID int,						-- Used only in uspGene_Create for insert.
+	@intPopulationID int,					-- Used only in svfGetRandomGene for transpose.
+	@intGenomeID int,						-- ID of current genome to be evolved.
+	@tblAnalysis as Alg.udttConfig READONLY	-- Holds analysis parameters
+AS
+BEGIN
+	SET NOCOUNT ON;
+
+	-- Declare variables used for returning the random mutation.
+	DECLARE @bytCurrentGenes as tinyint,	-- Number of genes in the current genome.
+			@bytGeneCode tinyint,			-- Code of the randomly selected gene that will be evolved.
+			@bytType tinyint,				-- Type of gene to be evolved, used in svfGetRandomMutation and strOperator.
+			@bytMaxGenes tinyint,			-- Maximum number of genes per genome, used to get strMutation.
+			@strMutation nvarchar(10);		-- Type of evolutionary mutation to apply to the gene.
+			
+	-- Declare the local variables used in the various mutations.
+	DECLARE @bytNewGeneCode tinyint,		-- Incremented gene code, used for insert and transpose.
+			@intOldGeneID as int,			-- Random gene ID from the breeding population, only used for transpose.
+			@intNewGeneID as int,			-- ID of new gene created by Transpose
+			@strLogical nvarchar(1),		-- Random Logical operator
+			@strComparison nvarchar(2);		-- Random comparison operator
+
+	-- First get the random mutation.
+	SELECT @bytCurrentGenes = COUNT(fldCode) FROM Alg.tvfCurrentGenes(@intGenomeID); 
+	SELECT @bytGeneCode = Alg.svfGetRandomCode(RAND(), @bytCurrentGenes);
+	SELECT @bytType = fldType FROM Alg.tvfCurrentGenes(@intGenomeID) WHERE fldCode = @bytGeneCode;
+	SELECT @bytMaxGenes = fldValue FROM @tblAnalysis WHERE fldText = 'Max Genes';
+	SELECT @strMutation = Alg.svfGetRandomMutation(@tblAnalysis, 'Gene', RAND(), @bytType,
+							CASE WHEN @bytCurrentGenes = 1 THEN 1 ELSE 0 END, 
+							CASE WHEN @bytCurrentGenes = @bytMaxGenes THEN 1 ELSE 0 END);
+
+	IF @strMutation = 'Insert'
+	-- Create an entirely new gene by calling uspGene_Create
+	BEGIN
+		SELECT @bytNewGeneCode = MAX(fldCode) + 1 FROM Alg.tvfCurrentGenes(@intGenomeID);
+		EXEC Alg.uspGene_Create @intAnalysisID, @intGenomeID, @bytNewGeneCode, @tblAnalysis;
+	END
+	
+	IF @strMutation = 'Remove'
+	-- Delete the specified Gene from tmpGene which cascades to tmpCodon and decrement the larger codes
+	BEGIN
+		DELETE FROM Alg.tvfCurrentGenes(@intGenomeID) WHERE (fldCode = @bytGeneCode);
+		UPDATE Alg.tvfCurrentGenes(@intGenomeID) SET fldCode -= 1 WHERE (fldCode > @bytGeneCode);
+	END
+
+	IF @strMutation = 'Transpose'
+	-- Copy an existing random gene plus its codons from the breeding population into tmpGene. 
+	BEGIN
+		-- Get a random gene from the tmpBreedingPopulation and copy it into tmpGene.
+		-- Note that it's not necessary to copy the brackets because the whole new genome will be rebracketed.
+		SELECT @bytNewGeneCode = MAX(fldCode) + 1 FROM Alg.tvfCurrentGenes(@intGenomeID);
+		SELECT @intOldGeneID = Alg.svfGetRandomGene(@intPopulationID, RAND());
+		INSERT INTO Alg.tmpGene (
+					fldGenomeID, 
+					fldCode, 
+					fldLogical,
+					fldComparison,
+					fldType)
+			SELECT	@intGenomeID,
+					@bytNewGeneCode,
+					fldLogical,
+					fldComparison,
+					fldType
+			FROM Alg.tmpGene 
+			WHERE fldID = @intOldGeneID;
+		SET @intNewGeneID = SCOPE_IDENTITY();
+
+		-- And copy the codons for this gene - but include the brackets.
+		INSERT INTO Alg.tmpCodon (
+					fldGeneID,
+					fldCode,
+					fldLeft,
+					fldRight,
+					fldOrder,
+					fldArithmetic,
+					fldVariableID,
+					fldValueID)
+			SELECT	@intNewGeneID,
+					C.fldCode,
+					C.fldLeft,
+					C.fldRight,
+					C.fldOrder,
+					C.fldArithmetic,
+					C.fldVariableID,
+					C.fldValueID
+			FROM Alg.tmpCodon AS C
+			WHERE fldGeneID = @intOldGeneID;
+	END
+
+	IF @strMutation = 'Logical'
+	-- Randomly mutate the logical operator in the specified gene
+	BEGIN
+		SELECT @strLogical = Alg.svfGetRandomOperator(@intAnalysisID, 'Logical', RAND(), @bytType);
+		UPDATE Alg.tvfCurrentGenes(@intGenomeID) SET fldLogical = @strLogical WHERE (fldCode = @bytGeneCode);
+	END
+
+	IF @strMutation = 'Comparison'
+	-- Randomly mutate the operator in the specified gene
+	BEGIN
+		SELECT @strComparison = Alg.svfGetRandomOperator(@intAnalysisID, 'Comparison', RAND(), @bytType);
+		UPDATE Alg.tvfCurrentGenes(@intGenomeID) SET fldComparison = @strComparison WHERE (fldCode = @bytGeneCode);
+	END
+
+	IF @strMutation IN ('Rebracket', 'Insert', 'Remove', 'Transpose')
+	-- Rebracket the whole genome
+	BEGIN
+		EXEC Alg.uspGene_Rebracket @intGenomeID;
+	END
+
+END
+GO
+
+/****** Object:  StoredProcedure [Alg].[uspGene_Create]    Script Date: 05/08/2024 11:19:01 ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+/*
+===================================================================================================
+Author:			Simon Poulton
+Create date:	21/12/2016
+Description:	Creates a single new gene record in tmpCurrentGene.  It then calls uspCodonCreate
+				a variable number of times, up to the maximum number of codons allowed.
+===================================================================================================
+*/
+CREATE PROCEDURE [Alg].[uspGene_Create] 
+	@intAnalysisID int,						-- Used create the random variable and passed to uspCodon_Create
+	@intGenomeID int,						-- ID for the current genome.
+	@bytGeneCode tinyint,					-- Code for the new gene to be created
+	@tblAnalysis as Alg.udttConfig READONLY	-- Holds analysis parameters
+AS
+BEGIN
+	SET NOCOUNT ON;
+
+	DECLARE	@intVariableID as int,			-- Holds the ID of the new random variable.
+			@bytType as tinyint,			-- Holds the type of this variables
+			@strLogical as nvarchar(1),		-- Holds a random logical operator for the gene.
+			@strComparison as nvarchar(10),	-- Holds a random comparison operator based on the variable.
+		
+			@intGeneID as int,				-- ID for the gene created here.
+			@bytMaxCodons as tinyint,		-- Used for controlling the codon creation loop.
+			@bytCodonCounter as tinyint = 1,	-- Counter for codon loop.
+			@fltNewCodon as float,			-- Probability of a new codon being created within the loop.
+			@blnNewCodon as bit = 1;		-- Boolean flag to control codon generation loop.
+
+	-- First get a random variable and its type 
+	SELECT @intVariableID = Alg.svfGetRandomVariable(@intAnalysisID, RAND(), 0);
+	SELECT @bytType = fldType FROM Alg.tvfVariable(@intAnalysisID) WHERE fldID = @intVariableID;
+
+	-- Next get random logical and comparison operators 
+	SELECT @strLogical = Alg.svfGetRandomOperator(@intAnalysisID, 'Logical', RAND(), 0);
+	SELECT @strComparison = Alg.svfGetRandomOperator(@intAnalysisID, 'Comparison', RAND(), @bytType);
+	
+	-- Use these to insert a new record into the temp gene table.  
+	INSERT INTO Alg.tmpGene (
+				fldGenomeID, 
+				fldCode, 
+				fldLogical,
+				fldComparison,
+				fldType)
+		VALUES(	@intGenomeID,
+				@bytGeneCode, 
+				@strLogical,
+				@strComparison,
+				@bytType);
+	SET @intGeneID = SCOPE_IDENTITY();
+
+	-- Now create up to the specified number of codons.
+	SELECT @bytMaxCodons = CASE WHEN @bytType <> 4 THEN 1 ELSE fldValue END
+		FROM @tblAnalysis WHERE fldText = 'Max Codons';
+	SELECT @fltNewCodon = fldValue/100 FROM @tblAnalysis WHERE fldText = 'New Codon';
+	
+	WHILE (@bytCodonCounter <= @bytMaxCodons) AND (@blnNewCodon = 1)
+	BEGIN
+		EXEC Alg.uspCodon_Create @intAnalysisID, @intGeneID, @bytCodonCounter, @intVariableID
+		  
+		-- Now increment the codon code and test for last codon
+		SET @bytCodonCounter += 1
+		SET @blnNewCodon = CASE WHEN RAND() < @fltNewCodon THEN 1 ELSE 0 END;
+	END
+
+	-- Finally, bracket the codons in this gene
+	EXEC Alg.uspCodon_Rebracket @intGeneID;
+
+	RETURN @intGeneID;
+END
+GO
+
+/****** Object:  StoredProcedure [Alg].[uspPopulation_StoreProgress]    Script Date: 05/08/2024 11:19:02 ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+/*
+===================================================================================================
+Author:			Simon Poulton
+Create date:	20/12/2016
+Description:	Stores the progress of the specified population during running.  It also tests the
+				current status and returns it.
+Amend date:		27/08/2020
+Description:	I have removed the test of "perfect" discriminations, because it's not!
+				UNfortunately, the only way to detect perfect discriminations is either phi = 1
+				or from the classification table, neither of which are easily available at this
+				stage.  So, for now, I've just increased the threshold to score = 1, which will 
+				still work for single gene/codon rules.
+===================================================================================================
+*/
+CREATE PROCEDURE [Alg].[uspPopulation_StoreProgress] 
+	@intPopulationID as int,						
+	@dtmPopStart as datetime2(7),
+	@intGenCurrent as int,
+	@intGenMax as int,
+	@fltStoppingRule as float
+AS
+BEGIN
+	SET NOCOUNT ON;
+
+	DECLARE @fltMaxScore as float,
+			@intMaxScoreGen as int,
+			@fltProgress as float,
+			@fltTotal as float,
+			@fltElapsed as float,
+			@fltRemaining as float,
+			@intStoppingGens as int,	-- Number of generations without improvement that causes a stop.
+			@bytStatus as tinyint;		-- Status of the population cycle, can only set by user from front-end.
+
+	-- First get the current maximum score and the first generation it was attained.
+	SELECT @fltMaxScore = MAX(fldScore) 
+		FROM Alg.tmpGenome 
+		WHERE (fldPopulationID = @intPopulationID);
+	SELECT @intMaxScoreGen = MIN(fldGeneration) 
+		FROM Alg.tmpGenome 
+		WHERE (fldPopulationID = @intPopulationID) AND (fldScore = @fltMaxScore); 
+	
+	-- set the values of the local variables
+	SET @fltProgress = (CAST(@intGenCurrent AS FLOAT) / CAST(@intGenMax AS FLOAT));
+	SET @fltElapsed = DATEDIFF(s, @dtmPopStart, GetDate());
+	SET @fltTotal = @fltElapsed / @fltProgress;
+	SET @fltRemaining = @fltTotal - @fltElapsed;
+	
+	-- Insert them into tmpProgress and return the blnStopped flag
+	INSERT INTO Alg.tmpProgress VALUES(
+		@intPopulationID,
+		@intGenCurrent,
+		@fltMaxScore,
+		@intMaxScoreGen,
+		@fltElapsed,
+		@fltRemaining);
+		
+	-- Finally, get the population status to see if it is still running (3) or user-cancelled (4) 
+	SELECT @bytStatus = fldStatus from BE.tblPopulation WHERE fldID = @intPopulationID;
+	IF @bytStatus = 3
+	BEGIN
+		-- Test if there has been no improvement for the specified number of generations
+		-- then set the status to stopped (5).
+		SET @intStoppingGens = CAST((CAST(@intGenMax as float) * @fltStoppingRule) as int);
+		IF (@intGenCurrent - @intMaxScoreGen) > @intStoppingGens
+			SET @bytStatus = 5;
+		ELSE
+		BEGIN
+			-- Next test if a perfect discrimination has been reached (based on there being 
+			-- gene or codon penalties of at least 1%.  NB: see amendment
+			IF @fltMaxScore = 1  -- > 0.99
+			BEGIN
+				SET @bytStatus = 5;
+			END;
+			ELSE
+			BEGIN
+				-- Finally test if the maximum number of generations has been reached and, if so,
+				-- set the status to completed (6).
+				IF @intGenCurrent >= @intGenMax
+					SET @bytStatus = 6;
+			END;
+		END; 
+	END;
+
+	RETURN @bytStatus;	
+END
+GO
+
+/****** Object:  StoredProcedure [Alg].[uspDiscrimination_SetTarget]    Script Date: 05/08/2024 11:19:02 ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+/*
+===================================================================================================
+Author:			Simon Poulton
+Create date:	15/12/2017
+Description:	Update the target column on #tblDataCrosstab using the expression(s) held in one
+				of two source tables; a) BE.tblTarget or b) #tmpTargetValue.  These values are
+				provided in the second parameter.
+===================================================================================================
+*/
+CREATE PROCEDURE [Alg].[uspDiscrimination_SetTarget] 
+	@intDiscriminationID AS int,
+	@strSource as nvarchar(100)
+AS
+BEGIN
+	SET NOCOUNT ON;
+
+	DECLARE @strSQL as nvarchar(max),
+			@strParams as nvarchar(max);
+
+	SET @strSQL = '
+		UPDATE #tblDataCrosstab SET fldTarget = NULL; 
+
+		UPDATE D 
+			SET fldTarget = T.fldBranch 
+			FROM ' + @strSource + ' AS T
+				INNER JOIN #tblDataCrosstab AS D
+					ON T.fldCode = D.fldTargetCode
+			WHERE T.fldDiscriminationID = @intDiscriminationID; ';
+
+	SET @strParams = '@intDiscriminationID int'
+	EXECUTE sp_executesql @strSQL, @strParams, @intDiscriminationID;
+END
+GO
+
+/****** Object:  StoredProcedure [Alg].[uspDiscrimination_Insert]    Script Date: 05/08/2024 11:19:02 ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+/*
+====================================================================================================
+Author:			Simon Poulton
+Create date:	07/12/2017
+Description:	Inserts a new discrimination record into the hierarchy based on the specified 
+				discrimination and branch.  It also inserts the relevant target records.  
+====================================================================================================
+*/
+CREATE PROCEDURE [Alg].[uspDiscrimination_Insert]
+	@intDiscriminationID as int,			-- Parent discrimination ID
+	@blnBranch as bit						-- True or False branch.
+AS
+BEGIN
+	SET NOCOUNT ON;
+
+	DECLARE @intAnalysisID as int,
+			@hid as hierarchyid,
+			@intNewDiscID as int;
+
+	SELECT	@intAnalysisID = fldAnalysisID, 
+			@hid = hierarchyid::Parse(fldBranch.ToString() + CAST(@blnBranch as nvarchar(1)) + '/')
+		FROM BE.tblDiscrimination WHERE fldID = @intDiscriminationID;
+
+	-- Insert the new discrimination record.
+	INSERT INTO BE.tblDiscrimination (fldAnalysisID, fldBranch)
+		VALUES(@intAnalysisID, @hid);
+	SET @intNewDiscID = SCOPE_IDENTITY();
+
+	-- Insert the target records copied from the parent, setting all the new branch flags to false.
+	INSERT INTO BE.tblTarget 
+		SELECT @intNewDiscID, 
+			fldValueID,
+			ROW_NUMBER() OVER (ORDER BY fldCode),
+			0
+			FROM BE.tblTarget 
+			WHERE (fldDiscriminationID = @intDiscriminationID) 
+				AND (fldBranch = @blnBranch);
+
+	RETURN @intNewDiscID; 
+END
+GO
+
+/****** Object:  StoredProcedure [Alg].[uspDiscrimination_EvaluateTargets]    Script Date: 05/08/2024 11:19:02 ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+/*
+====================================================================================================
+Author:			Simon Poulton
+Create date:	12/12/2017
+Description:	This procedure evaluates all potential target combinations for the specified
+				discrimination.  It uses three local temporary tables (#tmpTarget, #tmpTargetValue
+				and #tmpTally and one process-keyed table (Alg.tmpPredictorGenome).  It requires 
+				#tmpTally to simplify the coding in the dynamic SQL, but then these	data are passed 
+				to a table variable for onward passing to the tvfGetGenomeScores.
+
+				Firstly, the number of categories (records) for the discrimination are already held
+				in tblTarget, where the values for fldBranch are all set to 0.  If the number of 
+				categories is 2 then the second category is defined deterministically as the first
+				target value.  Otherwise, all combinations of targets are evaluated against all the
+				pre-populated predictor genomes in two nested loops. Each evaluation generates a
+				single Phi coefficient which is stored back in tmpPredictorGenomes.  At the end of 
+				the inner loop the average of the top 20% of scores	is stored in #tblTarget.  At the 
+				end of the outer loop, the values of fldBranch in tblTarget are updated to 1 in all 
+				the records in tblTarget that belong to the highest scoring target.
+Amend Date:		18/01/2017
+Description:	Included fldFilter in tblTarget at line 104.
+====================================================================================================
+*/
+CREATE PROCEDURE [Alg].[uspDiscrimination_EvaluateTargets]
+	@intDiscriminationID as int
+AS
+BEGIN
+	SET NOCOUNT ON;
+
+	-- **** INITIALISE THE TEMP TABLES AND VARIABLES FOR THIS PROC ************************************
+	-- Table to hold the unique combinations of target categories, defined deterministically by the
+	-- number of categories - looked up in tblLookupMultinomials.
+	CREATE TABLE #tmpTarget( 
+		fldDiscrimination tinyint, 
+		fldScore float);
+
+	-- Table to hold the actual values generated for each potential discrimination.
+	CREATE TABLE #tmpTargetValue(
+		fldDiscrimination tinyint,
+		fldCode tinyint,
+		fldBranch bit);
+
+	-- Table to hold the 2 x 2 tallies of the binary flags in #tmpEvaluate, which are then passed to
+	-- local variables for scoring.
+	CREATE TABLE #tmpTally (
+		fldTarget int, 
+		fldPredictor int, 
+		fldN int);
+
+	-- Local variables used for controlling flow of the procedure.
+	DECLARE @intAnalysisID as int,
+			@bytCategories as tinyint,
+			@bytTargets as tinyint,
+			@bytTargetCounter as tinyint,
+			@bytPredictors as tinyint,
+			@bytPredictCounter as tinyint,
+			@bytTopTarget as tinyint;
+			
+	DECLARE	--@strTarget as varchar(max),
+			@strOperator as nvarchar (max), 
+			@strOperand as nvarchar (max),
+			@strPredictor as varchar(max),
+			@strSQL as nvarchar(max);
+
+	-- Variables used to calculate the Phi coefficient.
+	DECLARE @tblTally as Alg.udttGenomeScore,
+			@Phi as float; 
+	--- **** END OF INITIALISATIONS ******************************************************************
+
+
+	-- Get the Analysis ID, the number of predictors and the number of categories in the discrimination.
+	SELECT @intAnalysisID = fldAnalysisID FROM BE.tblDiscrimination WHERE fldID = @intDiscriminationID;
+	SELECT @bytPredictors = COUNT(fldRN) FROM Alg.tvfPredictorGenome(@intAnalysisID);
+	SELECT @bytCategories = COUNT(fldID) FROM BE.tblTarget WHERE fldDiscriminationID = @intDiscriminationID;
+	--SELECT @bytCategories = COUNT(DISTINCT fldValueID) FROM #tblDataCrosstab;
+
+	-- If there are only two categories then just create the deterministic target expression and return.
+	IF @bytCategories = 2
+	BEGIN
+		UPDATE BE.tblTarget 
+			SET fldBranch = 1 
+			WHERE (fldDiscriminationID = @intDiscriminationID) AND (fldCode = 1);
+		RETURN;
+	END
+
+	-- **** POPULATE THE TWO TEMP TARGET TABLES ***************************************************
+	-- Populate #tmpTarget with the value combinations from the multinomial lookup table 
+	-- and return the number of records.
+	INSERT INTO #tmpTarget 
+		SELECT DISTINCT fldDiscrimination, NULL 
+			FROM tblLookupMultinomials 
+			WHERE fldCategories = @bytCategories; 
+	SELECT @bytTargets = COUNT(fldDiscrimination) FROM #tmpTarget;
+
+	-- Populate #tmpTargetValue with all the value IDs specified by the multinomial lookup table.
+	INSERT INTO #tmpTargetValue 
+		SELECT  LU.fldDiscrimination,
+				LU.fldCode,
+				LU.fldBranch  
+			FROM tblLookupMultinomials AS LU
+				INNER JOIN BE.tblTarget AS T
+					ON LU.fldCode = T.fldCode 
+			 WHERE (LU.fldCategories = @bytCategories)
+				AND (T.fldDiscriminationID = @intDiscriminationID);
+
+	-- **** EVALUEATE EACH predictor against each potential target ***********************************
+	-- Loop through all the potential target combinations in #tmpTarget.
+	SET @bytTargetCounter = 1;
+	WHILE @bytTargetCounter <= @bytTargets
+	BEGIN
+		-- Update the target column in #tblDataCrosstab
+		UPDATE #tblDataCrosstab SET fldTarget = NULL; 
+		UPDATE DC 
+			SET fldTarget = TV.fldBranch 
+			FROM #tblDataCrosstab AS DC
+				INNER JOIN BE.tblTarget AS T
+					ON DC.fldValueID = T.fldValueID  
+				INNER JOIN #tmpTargetValue AS TV
+					ON T.fldCode = TV.fldCode 
+			WHERE (T.fldDiscriminationID = @intDiscriminationID)
+				AND (TV.fldDiscrimination = @bytTargetCounter); 
+--select * into ##tmpEvoalg from #tblDataCrosstab;
+--drop table ##tmpEvoalg;
+
+		-- Now loop through all the predictor records in tmpPredictorGenome.   Note that this loop only uses
+		-- the value IDs not the actual values (held in Varnnn...V) because no arithemtic operators are used.
+		SELECT @bytPredictCounter = 1;
+		WHILE @bytPredictCounter <= @bytPredictors
+		BEGIN
+			-- Create the predictor string for the current record.
+			SELECT	@strOperator = 'Var' + CAST(fldVariableID as varchar(10)),  
+					@strOperand = ' ' + fldComparison + ' ' + CAST(fldValueID as varchar(10))  
+				FROM Alg.tvfPredictorGenome(@intAnalysisID) 
+				WHERE (fldRN = @bytPredictCounter);
+			SET @strPredictor = '
+				CASE WHEN (' + @strOperator + ' IS NULL) THEN -1 ELSE 
+				CASE WHEN (' + @strOperator + @strOperand + ') THEN 1 ELSE 0 END END'; 
+
+			-- Concatenate the SQL string needed to evaluate #tmpDataCrosstab and store the value in #tmpTally 
+			DELETE FROM #tmpTally;
+			SELECT @strSQL = 'INSERT INTO #tmpTally SELECT fldTarget, 
+				' + @strPredictor + ' AS fldPredictor, 
+				COUNT(fldRecordID) AS fldN 
+				FROM #tblDataCrosstab 
+				WHERE fldTarget IS NOT NULL 
+				GROUP BY fldTarget,	
+				' + @strPredictor + '; '; 
+			EXEC(@strSQL);
+
+			-- Now get the phi coefficient and update the Predictor genome record with this score.
+			INSERT INTO @tblTally SELECT * FROM #tmpTally;
+			SELECT @phi = fldPhi FROM Alg.tvfGetGenomeScores(@tblTally, 'Target Evaluation', 0, 0, 0, 0);
+			
+			UPDATE Alg.tvfPredictorGenome(@intAnalysisID) 
+				SET fldScore = @Phi 
+				WHERE fldRN = @bytPredictCounter;
+			
+			SET @bytPredictCounter += 1;
+		END;
+
+		-- Calculate the average scores of the top 20% genomes and save them in the tmpTarget table.
+		WITH FirstPass AS (
+			SELECT TOP 20 PERCENT fldScore 
+				FROM Alg.tvfPredictorGenome(@intAnalysisID)  ORDER BY fldScore DESC)
+			UPDATE #tmpTarget 
+				SET fldScore = (SELECT AVG(fldScore) FROM FirstPass)
+				WHERE fldDiscrimination = @bytTargetCounter;
+
+		SET @bytTargetCounter += 1;
+	END;
+--select * from #tmpTarget;
+
+	-- **** STORE THE RESULTS ********************************************************************** 
+	-- Update BE.tblTarget with the flag from fldBranch in #tmpTargetValue, using the highest  
+	-- scoring target in #tmpTarget.
+	SELECT TOP 1 @bytTopTarget = fldDiscrimination  
+		FROM #tmpTarget ORDER BY fldScore DESC
+
+	UPDATE T 
+		SET	fldBranch = TV.fldBranch 
+		FROM #tmpTargetValue AS TV
+			INNER JOIN BE.tblTarget AS T
+				ON TV.fldCode = T.fldCode 
+		WHERE (T.fldDiscriminationID = @intDiscriminationID) 
+			AND (TV.fldDiscrimination = @bytTopTarget);
+
+END
+GO
+
+/****** Object:  StoredProcedure [Alg].[uspDiscrimination_BuildNode]    Script Date: 05/08/2024 11:19:02 ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+/*
+===================================================================================================
+Author:			Simon Poulton
+Create date:	08/12/2017
+Description:	Encapsulates the three stored procs for building a new node in the discrimination
+				hierarchy for the specified parent discrimination and branch.
+===================================================================================================
+*/
+CREATE PROCEDURE [Alg].[uspDiscrimination_BuildNode] 
+	@intDiscriminationID as int,
+	@blnBranch as bit
+AS
+BEGIN
+	SET NOCOUNT ON;
+
+	-- Set the current node flag to true
+	IF @blnBranch = 0
+		UPDATE BE.tblDiscrimination	SET fldNodeFalse = 1 WHERE fldID = @intDiscriminationID;
+	ELSE
+		UPDATE BE.tblDiscrimination	SET fldNodeTrue = 1 WHERE fldID = @intDiscriminationID;
+
+	-- Create a new discrimination (with target records) and return the ID.
+	EXEC @intDiscriminationID = Alg.uspDiscrimination_Insert @intDiscriminationID, @blnBranch;
+	
+	-- Evaluate the potential targets for the new discrimination.
+	EXEC Alg.uspDiscrimination_EvaluateTargets @intDiscriminationID;
+
+	RETURN @intDiscriminationID;
+END
+GO
+
+/****** Object:  StoredProcedure [Alg].[uspCodon_Rebracket]    Script Date: 05/08/2024 11:19:02 ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+/*
+=======================================================================================================
+Author:			Simon Poulton
+Create date:	29/11/2016
+Description:	BRILLIANT CODING!!!
+				I've finally cracked how to specify and store the information required for
+				bracketing these expressions.  It is based on FIVE logical rules;
+				a)	there will always be n - 1 pairs of brackets.
+				b)	The count of all the left brackets must equal the count of all the right brackets.
+				c)	Any one term must have left or right brackets - not both or neither.
+				d	Any one term can have between zero and n - 1 brackets.
+				e)	The whole genome expression must begin with a term with left brackets and end
+					with a term with right brackets, but apart from this the terms can be in any order.
+=======================================================================================================
+*/
+CREATE PROCEDURE [Alg].[uspCodon_Rebracket] 
+	@intGeneID int
+AS
+BEGIN
+	SET NOCOUNT ON;
+
+	DECLARE @bytRecords as tinyint,
+			@bytCode as tinyint,
+			@bytLefts as tinyint = 0,
+			@bytRights as tinyint = 0;
+
+	-- First get the number of codon records in the current gene.
+	SELECT @bytRecords = COUNT(fldCode) FROM Alg.tmpCodon WHERE (fldGeneID = @intGeneID);
+
+	-- Clear the current genes of brackets and set the order to unity.
+	UPDATE Alg.tmpCodon SET fldLeft = '', fldRight = '', fldOrder = 1
+		WHERE (fldGeneID = @intGeneID);
+
+	IF @bytRecords > 1
+	-- Only add brackets if more than one record
+	BEGIN
+		-- Add n-1 left brackets randomly to the records
+		WHILE @bytLefts < (@bytRecords - 1)
+		BEGIN
+			SET @bytCode = Alg.svfGetRandomCode(RAND(), @bytRecords)
+		
+			UPDATE Alg.tmpCodon 
+				SET fldLeft += '(', fldOrder = CASE WHEN @bytLefts = 0 THEN 0 ELSE fldOrder END
+				WHERE ((fldGeneID = @intGeneID) AND (fldCode = @bytCode));
+			SET @bytLefts += 1;
+		END
+
+		-- Now add one right bracket to all records with no left brackets and count them.
+		UPDATE Alg.tmpCodon SET fldRight += ')' 
+			WHERE ((fldGeneID = @intGeneID) AND (fldLeft = ''));
+		SET @bytRights = @@ROWCOUNT;
+
+		-- Finally, randomly add the remaining rights (up to n-1) to records with no lefts.
+		WHILE @bytRights < (@bytRecords - 1) 
+		BEGIN
+			SET @bytCode = Alg.svfGetRandomCode(RAND(), @bytRecords)
+
+			-- Test to ensure that only records with no lefts are selected.
+			IF (SELECT fldLeft FROM Alg.tmpCodon
+				WHERE ((fldGeneID = @intGeneID) AND (fldCode = @bytCode))) = '' 
+			BEGIN
+				UPDATE Alg.tmpCodon
+					SET fldRight += ')', fldOrder = CASE WHEN @bytRights = (@bytRecords - 2) THEN 2 ELSE fldOrder END
+					WHERE ((fldGeneID = @intGeneID) AND (fldCode = @bytCode));
+				SET @bytRights += 1;
+			END
+		END
+	END
+	ELSE
+	-- Just set the order to zero for evaluation.
+	BEGIN
+		UPDATE Alg.tmpCodon SET fldOrder = 0 WHERE (fldGeneID = @intGeneID);
+	END
+END
+GO
+
+/****** Object:  StoredProcedure [Alg].[uspCodon_Evolve]    Script Date: 05/08/2024 11:19:02 ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+/*
+===================================================================================================
+Author:			Simon Poulton
+Create date:	23/12/2016
+Description:	Takes the specified Gene and evolves it according to a random mutation.   
+				Note that if this is explicitly 'Rebracket' or one of the first three in the list, 
+				then it calls the Rebracket proc.  It does not do this for the arithemtic and value 
+				mutations.
+===================================================================================================
+*/
+CREATE PROCEDURE [Alg].[uspCodon_Evolve] 
+	@intAnalysisID int,						-- Used only in uspGene_Create for insert.
+	@intPopulationID int,					-- Used only in svfGetRandomGene for transpose.
+	@intGenomeID int,						-- ID of current genome to be evolved.
+	@tblAnalysis as Alg.udttConfig READONLY	-- Holds analysis parameters
+AS
+BEGIN
+	SET NOCOUNT ON;
+
+	-- Declare variables used for returning the random mutation.
+	DECLARE @bytCurrentGenes as tinyint,	-- Number of genes in the current genome.
+			@bytGeneCode tinyint,			-- Code of the randomly selected gene that will be evolved.
+			@intGeneID as int,				-- ID of the randomly selected gene.
+			@bytType tinyint,				-- Type of gene to be evolved, used in svfGetRandomMutation and strArithmetic.
+			@bytCurrentCodons tinyint,		-- Number of codons in the current gene.
+			@bytMaxCodons tinyint,			-- Maximum number of codons per gene, used to get strMutation.
+			@strMutation nvarchar(10);		-- Type of evolutionary mutation to apply to the codon.
+
+	-- Local variables used in the various mutations.
+	DECLARE 
+			@bytNewCodonCode tinyint,		-- Incremented codon code, used for insert and transpose.
+			@bytCodonCode as tinyint,		-- Code for random codon to be evolved
+			@intOldCodonID as int,			-- Random codon ID from the breeding population, only used for transpose.
+			@strArithmetic nvarchar(1),		-- Random arithmetic operator.
+			@intVariableID as int,			-- Only used for getting random value.
+			@intValueID as int;				-- Random Value ID. 
+
+	-- First get the random mutation.
+	SELECT @bytCurrentGenes = COUNT(fldCode) FROM Alg.tvfCurrentGenes(@intGenomeID); 
+	SELECT @bytGeneCode = Alg.svfGetRandomCode(RAND(), @bytCurrentGenes);
+	SELECT @intGeneID = fldID, @bytType = fldType FROM Alg.tvfCurrentGenes(@intGenomeID) WHERE fldCode = @bytGeneCode;
+	SELECT @bytCurrentCodons = COUNT(fldCode) FROM Alg.tvfCurrentCodons(@intGeneID); 
+	SELECT @bytMaxCodons = fldValue FROM @tblAnalysis WHERE fldText = 'Max Codons';
+	SELECT @strMutation = Alg.svfGetRandomMutation(@tblAnalysis, 'Codon', RAND(), @bytType,
+							CASE WHEN @bytCurrentCodons = 1 THEN 1 ELSE 0 END, 
+							CASE WHEN @bytCurrentCodons = @bytMaxCodons THEN 1 ELSE 0 END);
+
+	SELECT @bytCodonCode = Alg.svfGetRandomCode(RAND(), @bytCurrentCodons);
+
+	IF @strMutation = 'Insert'
+	-- Create an entirely new codon by calling uspCodon_Create.  Note the setting of @intVariableID to 0
+	-- so that uspCodon_Create can get a random variableID
+	BEGIN
+		SELECT @bytNewCodonCode = MAX(fldCode) + 1 FROM Alg.tvfCurrentCodons(@intGeneID);
+		EXEC Alg.uspCodon_Create @intAnalysisID, @intGeneID, @bytNewCodonCode, 0;
+	END
+	
+	IF @strMutation = 'Remove'
+	-- Delete the specified codon from tmpCurrentCodon	and decrement the codons with greater codes.
+	BEGIN
+		DELETE FROM Alg.tvfCurrentCodons(@intGeneID) WHERE (fldCode = @bytCodonCode);
+		UPDATE Alg.tvfCurrentCodons(@intGeneID) SET fldCode -= 1 WHERE (fldCode > @bytCodonCode);
+	END
+
+	IF @strMutation = 'Transpose'
+	-- Copy an existing codon from the breeding population into tmpCurrentCodon. 
+	BEGIN	
+		-- Get a random codon from the tmpBreedingPopulation and copy it into tmpCurrentCodon
+		SELECT @bytNewCodonCode = MAX(fldCode) + 1 FROM Alg.tvfCurrentCodons(@intGeneID);
+		SELECT @intOldCodonID = Alg.svfGetRandomCodon(@intPopulationID, RAND());
+		INSERT INTO Alg.tmpCodon(
+					fldGeneID,
+					fldCode,
+					fldLeft,
+					fldRight,
+					fldOrder,
+					fldArithmetic,
+					fldVariableID,
+					fldValueID) 
+			SELECT	@intGeneID,
+					@bytNewCodonCode,
+					fldLeft,
+					fldRight,
+					fldOrder,
+					fldArithmetic,
+					fldVariableID,
+					fldValueID
+				FROM Alg.tmpCodon 
+				WHERE fldID = @intOldCodonID;
+	END
+
+	IF @strMutation = 'Arithmetic'
+	-- Randomly mutate the arithmetic in the specified codon
+	BEGIN
+		SELECT @strArithmetic = Alg.svfGetRandomOperator(@intAnalysisID, 'Arithmetic', RAND(), @bytType);
+		UPDATE Alg.tvfCurrentCodons(@intGeneID) SET fldArithmetic = @strArithmetic WHERE (fldCode = @bytCodonCode);
+	END
+
+	IF @strMutation = 'Value'
+	-- Randomly mutate the valueID in the specified codon
+	BEGIN
+		SELECT @intVariableID = fldVariableID FROM Alg.tvfCurrentCodons(@intGeneID) WHERE (fldCode = @bytCodonCode); 
+		SELECT @intValueID = Alg.svfGetRandomValue(@intAnalysisID, @intVariableID, RAND(), 0)
+		UPDATE Alg.tvfCurrentCodons(@intGeneID) SET fldValueID = @intValueID WHERE (fldCode = @bytCodonCode);
+	END
+
+	IF @strMutation IN ('Rebracket', 'Insert', 'Remove', 'Transpose')
+	-- Rebracket all the codons in the gene
+	BEGIN
+		EXEC Alg.uspCodon_Rebracket @intGeneID;
+	END
+
+END
+GO
+
+/****** Object:  StoredProcedure [Alg].[uspCodon_Create]    Script Date: 05/08/2024 11:19:02 ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+/*
+======================================================================================================
+Author:			Simon Poulton
+Create date:	22/12/2016
+Description:	Creates a single new codon record in tmpCurrentCodon.  
+				The variable ID will have been selected in the calling proc, but if this not is the 
+				first codon in a gene, then a new numeric variable will be randomly selected.
+======================================================================================================
+*/
+CREATE PROCEDURE [Alg].[uspCodon_Create] 
+	@intAnalysisID int,
+	@intGeneID int,							-- The ID of the gene to which this codon belongs.				
+	@bytCodonCode tinyint,					-- The sequential code for the codon within the	gene.			
+	@intVariableID as int					-- ID of the new random variable created.
+AS
+BEGIN
+	SET NOCOUNT ON;
+
+	DECLARE	@strArithmetic as nvarchar(1),	-- Holds the arithmetic operator for the codon.
+			@intValueID as int;				-- Holds the ID of a random value.
+
+	-- Get random values for the arithmetic operator, valueID and optionally the VariableID.
+	IF @bytCodonCode > 1 SELECT @intVariableID = Alg.svfGetRandomVariable(@intAnalysisID, RAND(), 1);
+	SELECT @strArithmetic = Alg.svfGetRandomOperator(@intAnalysisID, 'Arithmetic', RAND(), 0);
+	SELECT @intValueID = Alg.svfGetRandomValue(@intAnalysisID, @intVariableID, RAND(), 0);
+	
+	-- Insert these into a new record in tmpCodon.  
+	INSERT INTO Alg.tmpCodon(
+				fldGeneID,
+				fldCode,
+				fldArithmetic,
+				fldVariableID,
+				fldValueID)
+		VALUES(	@intGeneID,
+				@bytCodonCode, 
+				@strArithmetic,
+				@intVariableID, 
+				@intValueID);
+END
+GO
+
+/****** Object:  StoredProcedure [Alg].[uspAnalysis_Initialise]    Script Date: 05/08/2024 11:19:02 ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+/*
+===================================================================================================
+Author:			Simon Poulton
+Create date:	07/12/2017
+Description:	Initialises the specified ANALYSIS.
+				It sets the status of the analysis and primes the random number seed.  This ensures 
+				that each analysis will have a different sequence of random numbers.  The actual 
+				variable is not used.  Secondly, it populates the three process-keyed tables for the 
+				specified analysis, which are both invariant tables for the whole analysis:
+				1)	tmpAnalysisConfig, which holds the user-specified parameters for the analysis.
+				2)	tmpVariable, which takes the PREDICTOR variables specified in 
+					BE.tblAnalysisPredictor.
+				3)	tmpValue, which holds all the unique values for these variables as defined in
+					#tblDataCrosstab.
+===================================================================================================
+*/
+CREATE PROCEDURE [Alg].[uspAnalysis_Initialise] 
+	@intAnalysisID AS int
+AS
+BEGIN
+	SET NOCOUNT ON;
+
+	-- **** DECLARATIONS AND INITIALISATION *******************************************************
+	DECLARE @intVariableID as int;
+	DECLARE @strAnalysisID as varchar(10),
+			@strSQL as nvarchar(max),
+			@strVar as nvarchar(100);
+
+	-- Declare and prime the random number seed. 
+	DECLARE @fltSeed as float;
+	SET @fltSeed = rand(checksum(newid()));
+
+	-- Next set the status of the analysis to 3 (running) and the datetime
+	UPDATE BE.tblAnalysis SET fldStatus = 3, fldRun = GETDATE() WHERE fldID = @intAnalysisID;
+
+	SET @strAnalysisID = CAST(@intAnalysisID as varchar(10));
+
+	-- **** POPULATE THE SPID TEMPORARY TABLES USED IN THE ANALYSIS *******************************
+	DELETE FROM Alg.tvfAnalysisConfig(@intAnalysisID);
+	INSERT INTO Alg.tvfAnalysisConfig(@intAnalysisID)
+		SELECT @intAnalysisID, fldCategory, fldText, fldValue 
+			FROM BE.uvwAnalysisConfig WHERE fldAnalysisID = @intAnalysisID;
+
+	DELETE FROM Alg.tvfVariable(@intAnalysisID);
+	INSERT INTO Alg.tvfVariable(@intAnalysisID) 
+		SELECT @intAnalysisID,
+			ROW_NUMBER() OVER(ORDER BY V.fldID) AS RN,
+			V.fldID,
+			V.fldName,
+			V.fldType, 
+			CASE WHEN fldType <= 2 THEN 1 ELSE 0 END,
+			NULL 
+			FROM BE.tblVariable AS V
+				INNER JOIN BE.tblAnalysisPredictor AS AP
+					ON v.fldID = ap.fldVariableID 
+			WHERE (AP.fldAnalysisID = @intAnalysisID)
+				AND (AP.fldSelected = 1);
+
+	DELETE FROM Alg.tvfValue(@intAnalysisID);
+	-- Create a cursor from all the records just inserted into tvfVariable.
+	DECLARE csrVariable CURSOR FAST_FORWARD FOR
+		SELECT fldID FROM Alg.tvfVariable(@intAnalysisID) ORDER BY fldRN;
+	OPEN csrVariable;
+	FETCH NEXT FROM csrVariable INTO @intVariableID; 
+	WHILE @@FETCH_STATUS = 0
+	BEGIN
+		SET @strVar = 'Var' + CAST(@intVariableID AS varchar(100));
+		SET @strSQL = '
+			WITH FirstPass AS (
+				SELECT DISTINCT ' + @strVar + ' AS fldID FROM #tblDataCrosstab )
+				INSERT INTO Alg.tvfValue(' + @strAnalysisID + ') 
+					SELECT ' + @strAnalysisID + ', V.fldVariableID, 
+						ROW_NUMBER() OVER (PARTITION BY V.fldVariableID ORDER BY V.fldCode) AS RN,
+						V.fldID, V.fldCode, V.fldText
+						FROM BE.tblValue AS V
+							INNER JOIN FirstPass AS FP
+								ON V.fldID = FP.fldID;';
+		EXEC(@strSQL);
+		FETCH NEXT FROM csrVariable INTO @intVariableID;
+	END
+	CLOSE csrVariable;
+	DEALLOCATE csrVariable;
+
+	-- Use this table to update the temp variables table with the number of unique values
+	UPDATE V 
+		SET fldUniqueValues = VAL.fldUniqueValues 
+		FROM Alg.tvfVariable(@intAnalysisID) AS V
+			INNER JOIN 
+				(SELECT fldVariableID, COUNT(fldRN) AS fldUniqueValues
+					FROM Alg.tvfValue(@intAnalysisID)
+					GROUP BY fldVariableID) AS VAL
+				ON V.fldID = VAL.fldVariableID;
+
+END
+GO
+
+/****** Object:  StoredProcedure [Alg].[uspAnalysis_Deinitialise]    Script Date: 05/08/2024 11:19:02 ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+/*
+===================================================================================================
+Author:			Simon Poulton
+Create Date:	22/01/2018
+Description:	Just clears up the process-keyed tables and #tmpDataCrosstab from uspAnalysis_Run and
+				uspDiscrimination_BuildHierarchy
+===================================================================================================
+*/
+CREATE PROCEDURE [Alg].[uspAnalysis_Deinitialise] 
+	@intAnalysisID as int
+AS
+BEGIN
+	SET NOCOUNT ON;
+
+	DELETE FROM alg.tvfVariable(@intAnalysisID);
+	DELETE FROM alg.tvfValue(@intAnalysisID);
+	DELETE FROM alg.tvfAnalysisConfig(@intAnalysisID);
+	DELETE FROM alg.tvfPredictorGenome(@intAnalysisID);
+END
+GO
+
+/****** Object:  StoredProcedure [Alg].[uspAnalysis_CreatePredictorGenomes]    Script Date: 05/08/2024 11:19:02 ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+/*
+===================================================================================================
+Author:			Simon Poulton
+Create date:	08/12/2017
+Description:	Populates the temp table with random predictor genomes, with user-specified number 
+				of records.
+===================================================================================================
+*/
+CREATE PROCEDURE [Alg].[uspAnalysis_CreatePredictorGenomes]  
+(	
+	@intAnalysisID int
+)
+AS
+BEGIN
+	SET NOCOUNT ON;
+
+	DECLARE @intPredictVarID as int,
+			@strComparison as nvarchar(10),
+			@intPredictValID as int,
+			@bytType as tinyint;
+
+	DECLARE	@intPredictors as int,
+			@intPredictCounter as int = 1;
+
+	SELECT @intPredictors = Alg.svfGetAnalysisConfiguration(@intAnalysisID, 'Discriminating Pop');
+
+	DELETE FROM Alg.tvfPredictorGenome(@intAnalysisID);
+
+	WHILE @intPredictCounter <= @intPredictors			
+	BEGIN
+		SET @intPredictVarID = Alg.svfGetRandomVariable(@intAnalysisID, RAND(), 0);
+		SELECT @bytType = fldType FROM Alg.tvfVariable(@intAnalysisID) WHERE fldID = @intPredictVarID;
+		SET @strComparison = Alg.svfGetRandomOperator(@intAnalysisID, 'Comparison', RAND(), @bytType);
+		SET @intPredictValID = Alg.svfGetRandomValue(@intAnalysisID, @intPredictVarID, RAND(), 0);
+
+		INSERT INTO Alg.tmpPredictorGenome VALUES (
+				@intAnalysisID,
+				@intPredictCounter,
+				@intPredictVarID,
+				@strComparison,
+				@intPredictValID,
+				NULL);
+
+		SET @intPredictCounter += 1;
+	END;
+END
+GO
+
+/****** Object:  StoredProcedure [Alg].[uspDiscrimination_Run]    Script Date: 05/08/2024 11:19:02 ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+/*
+=============================================================================================================
+Author:			Simon Poulton
+Create date:	14/12/2017
+Description:	New procedure to run a complete discrimination.  This is the controlling proc for the whole 
+				evolutionalry algorithm.  It has been derived from uspAnalysis_Run, which now simply creates 
+				the temp data evalution table and derives the multinomial targets.
+Amend Date:		01/03/2018
+Description:	I have included a new sub-routine to set fldTargetRandom in #tblDataCrosstab.	This is only
+				run if the @blnRandomise flag is true. I have also created a sub-routine to toggle between
+				real and randomised populations, which is passed as a new parameter to uspPopulation_Create,
+				uspPopulation_Evolve and uspPopulation_StoreResult.			
+Amend Date:		08/09/2020
+Description:	I have modified the variables @bytPopulations and @bytPopCounter to be small integers,
+				thereby allowing more than 255 populations to be run in a single analysis.  For now,
+				I have left the name
+=============================================================================================================
+*/
+CREATE PROCEDURE [Alg].[uspDiscrimination_Run] 
+	@intDiscriminationID as int
+AS
+BEGIN
+	SET NOCOUNT ON;
+
+	-- **** DECLARATIONS ************************************************************************************
+	DECLARE @intAnalysisID as int,				-- ID of the parent analysis.
+			@blnRandomise as bit,				-- Randomisation flag for the parent analysis.
+			@blnRandomPop as bit,				-- Flag to indicate population is based on random target.
+			@intTarget1 as int,					-- Number of Traget-True records.
+			@bytDiscStatus as tinyint = 3;		-- Status of the current discrimination.
+
+	-- Table variable for the analysis configuration and probabilities.
+	DECLARE @tblAnalysis as Alg.udttConfig		-- Holds analysis parameters, passed to sub procs.
+			
+	-- Local variables to hold user-defined values from @tblAnalysis.
+	DECLARE @intPopulations as smallint,		-- User-defined number of populations.
+			@intGenerations as smallint,		-- Maximum number of generations within a population
+			@intProgressInterval as smallint,	-- Number of generations between storing progress.
+			@fltStoppingRule as float;			-- Passed to uspPopulation_StoreProgress.
+
+	-- Local variables for controlling the flow and progress of the analysis.
+	DECLARE @intPopCounter as smallint,		-- Counter for looping through the specified populations.
+			@dtmPopStart as datetime2(7),	-- Start time of each population cycle.
+			@bytPopStatus as tinyint,		-- Status of population, set in uspPopulation_StoreProgress.
+			@intGenCounter as smallint,		-- Counter for looping through the generations within a population
+			@intPopulationID as int;		-- ID of the population created in uspPopulation_Create.
+
+	-- **** END OF DECLARATIONS *****************************************************************************
+	
+	-- **** INITIALISE THE DISCRIMINATION *******************************************************************
+	SELECT @intAnalysisID = fldAnalysisID FROM BE.tblDiscrimination WHERE fldID = @intDiscriminationID;
+	SELECT @blnRandomise = fldTargetRandomise FROM BE.tblAnalysis WHERE fldID = @intAnalysisID;
+	UPDATE BE.tblDiscrimination SET fldStatus = @bytDiscStatus WHERE fldID = @intDiscriminationID;
+
+	-- Clear any child populations still remaining
+	DELETE FROM BE.tblPopulation WHERE fldDiscriminationID = @intDiscriminationID;
+
+	-- Now get the analysis parameters from tblAnalysisConfig and tblAnalysisPredictor 
+	-- and save them in @tblAnalysis
+	INSERT INTO @tblAnalysis 
+		SELECT fldCategory, fldText, fldValue 
+			FROM BE.uvwAnalysisConfig
+			WHERE fldAnalysisID = @intAnalysisID;
+	
+	-- Now get the local variables from the analysis table variable.
+	SELECT @intPopulations = fldValue FROM @tblAnalysis WHERE fldText = 'Populations';
+	SELECT @intGenerations = fldValue FROM @tblAnalysis WHERE fldText = 'Generations';
+	SELECT @intProgressInterval = fldValue FROM @tblAnalysis WHERE fldText = 'Progress Interval';
+	SELECT @fltStoppingRule = fldValue/100 FROM @tblAnalysis WHERE fldText = 'Stopping Rule';
+
+	-- Set the target column in #tblDataCrosstab - this is constant for the whole discrimination.
+	UPDATE #tblDataCrosstab SET fldTarget = NULL; 
+	UPDATE DC 
+		SET fldTarget = T.fldBranch 
+		FROM #tblDataCrosstab AS DC
+			INNER JOIN BE.tblTarget AS T
+				ON DC.fldValueID = T.fldValueID 
+		WHERE T.fldDiscriminationID = @intDiscriminationID;
+
+	-- New sub-routine to set the randomised target.
+	IF @blnRandomise = 1
+	BEGIN
+		SELECT @intTarget1 = COUNT(fldTarget) FROM #tblDataCrosstab WHERE fldTarget = 1;
+
+		UPDATE #tblDataCrosstab SET fldTargetRandom = NULL, fldRandom = NULL;
+		UPDATE #tblDataCrosstab 
+			SET fldRandom = RAND(CAST(NEWID() as varbinary)), fldTargetRandom = 0 
+			WHERE fldTarget IS NOT NULL;
+	
+		WITH FirstPass AS (
+			SELECT TOP(@intTarget1) * FROM #tblDataCrosstab ORDER BY fldRandom DESC)
+			UPDATE FirstPass SET fldTargetRandom = 1;
+	END;
+--select * from #tblDataCrosstab;
+-- **** END OF INITIALISATIONS ******************************************************************************
+
+-- **** POPULATION LOOP *************************************************************************************
+	-- Loop through the specified number of populations, as long as the discrimination status is still running.
+	SET @blnRandomPop = 0;
+	SET @intPopCounter = 1;
+	WHILE (@intPopCounter <= @intPopulations) AND (@bytDiscStatus = 3)
+	BEGIN 
+		-- Initialise the population run
+		SET @dtmPopStart = sysdatetime();
+		SET @bytPopStatus = 3;
+		SET @intGenCounter = 1;
+
+		-- Create the population for the specified discrimination and store the ID
+		EXEC @intPopulationID = Alg.uspPopulation_Create @intAnalysisID, @intDiscriminationID, @blnRandomPop, @tblAnalysis
+
+		-- Loop through the specified number of generations
+		WHILE (@intGenCounter <= @intGenerations ) AND (@bytPopStatus = 3)
+		BEGIN
+			-- Call the population evolving routine 
+			EXEC Alg.uspPopulation_Evolve @intAnalysisID, @intPopulationID, @intGenCounter, @blnRandomPop, @tblAnalysis; 
+
+			-- Set the progress in tmpProgress and return the population status
+			IF (@intGenCounter % @intProgressInterval) = 0
+				EXEC @bytPopStatus = Alg.uspPopulation_StoreProgress 
+						@intPopulationID, @dtmPopStart, @intGenCounter, @intGenerations, @fltStoppingRule;
+			
+			SET @intGenCounter += 1;
+		END
+		
+		-- Store the population results (reducing the generation counter byt one to represent the end of the previous block).
+		SET @intGenCounter -= 1;
+		EXEC Alg.uspPopulation_StoreResult @intAnalysisID, @intPopulationID, @bytPopStatus, @intGenCounter, @blnRandomPop, @tblAnalysis;
+		
+		-- Get the status of this discrimination, clear the progress table and, increment the pop counter.
+		SELECT @bytDiscStatus = fldStatus FROM BE.tblDiscrimination WHERE fldID = @intDiscriminationID;
+		DELETE FROM Alg.tvfProgress(@intAnalysisID);
+		--SET @intPopCounter += 1;
+
+		-- If randomisation is not set for the analysis, then just increment the population counter.
+		-- If it is set, toggle @blnRandomPop and only increment the population counter if WAS 1.
+		IF @blnRandomise = 0
+			SET @intPopCounter += 1
+		ELSE
+		BEGIN
+			IF @blnRandomPop = 0
+				set @blnRandomPop = 1
+			ELSE
+			BEGIN
+				SET @blnRandomPop = 0;
+				SET @intPopCounter += 1
+			END
+		END;	
+	
+		-- Delete the temporary tables for the currrent population
+		DELETE FROM Alg.tmpGenome where fldPopulationID = @intPopulationID;
+		DELETE FROM Alg.tmpProgress where fldPopulationID = @intPopulationID;
+	END
+-- **** END OF POPULATION LOOP ******************************************************************************
+
+	-- Update the status in tblDiscrimination if it has completed.
+	UPDATE BE.tblDiscrimination 
+		SET fldStatus = CASE WHEN fldStatus = 3 THEN 6 ELSE fldStatus END
+		WHERE fldID = @intDiscriminationID;
+END
+
+	--INSERT INTO @tblAnalysis 
+	--	SELECT 'Analysis', 'New Genomes', 2 * COUNT(fldID)
+	--		FROM BE.tblAnalysisPredictor 
+	--		WHERE fldAnalysisID = @intAnalysisID AND fldSelected = 1;
+GO
+
+/****** Object:  StoredProcedure [Alg].[uspPopulation_StoreResult]    Script Date: 05/08/2024 11:19:02 ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+/*
+===================================================================================================
+Author:			Simon Poulton
+Create date:	27/12/2016
+Description:	Stores the results of the specified population. 
+				The first two parameters are just the IDs passed down the calling stack.
+				The third and fourth parameters are used to update tblPopulation.
+				The fifth parameter is the flag for whether these are the results of the real
+				or random target records, which is passed on to uspGenome_Evaluate.  
+===================================================================================================
+*/
+CREATE PROCEDURE [Alg].[uspPopulation_StoreResult] 
+	@intAnalysisID as int,
+	@intPopID as int,
+	@intPopStatus as int,
+	@intGeneration as int,
+	@blnRandomPop bit,							
+	@tblAnalysis as Alg.udttConfig READONLY
+AS
+BEGIN
+	SET NOCOUNT ON;
+
+	-- **** DECLARATIONS **************************************************************************
+	DECLARE @tblTally as Alg.udttGenomeScore;
+
+	DECLARE	@intTempGenomeID as int,	-- used locally to hold the ID of the highest scoring genome.
+			@intPermGenomeID as int;	-- used to hold the ID of the Genome added to BE.tblGenome.
+	
+	DECLARE @fltGenePenalty as float, 
+			@fltCodonPenalty as float,
+			@bytGenes as tinyint,				-- Number of genes created by call to uspGenome_Create.
+			@bytCodons as tinyint,				-- Number of codons created by call to uspGenome_Create.  	
+			@fltPhi as float;					-- Holds the phi coefficient.
+			
+	-- **** GET THE HIGEST SCORING GENOME IN THE POPULATION AND SAVE THE RESULTS IN THE GENOME HIERARCHY ****
+	-- First populate the local variables
+	SELECT TOP 1 @intTempGenomeID = fldID
+		FROM Alg.tmpGenome	WHERE fldPopulationID = @intPopID
+		ORDER BY fldScore DESC, fldID ASC;
+
+	-- First update tblPopulation with the progress details.
+	WITH FirstPass (fldMaxScore, fldMaxScoreGen, fldElapsed) AS (
+		SELECT TOP 1 
+			fldMaxScore, fldMaxScoreGen, fldElapsed 
+			FROM Alg.tvfProgress(@intAnalysisID)
+			ORDER BY fldGeneration DESC
+		)
+		UPDATE	BE.tblPopulation SET 
+				fldStatus = @intPopStatus,
+				fldGenerationCompleted = @intGeneration,
+				fldGenerationMax = FP.fldMaxScoreGen,
+				fldMaxScore = FP.fldMaxScore,
+				fldElapsed = FP.fldElapsed
+			FROM BE.tblPopulation AS P,
+				FirstPass AS FP
+			WHERE fldID = @intPopID;
+
+	-- Now copy the highest scoring record from tmpGenome into BE.tblGenome. 
+	INSERT INTO BE.tblGenome (fldPopulationID, fldGeneration, fldCode, fldScore)
+		SELECT fldPopulationID, fldGeneration, fldCode, fldScore
+			FROM Alg.tmpGenome 
+			WHERE fldID = @intTempGenomeID;
+	SET @intPermGenomeID = SCOPE_IDENTITY();
+
+	-- And copy all its child records from tmpGene and tmpCodon.
+	INSERT INTO BE.tblGene (fldGenomeID, fldCode, fldLogical, fldLeft, fldRight, fldOrder, 
+							fldComparison, fldType)
+			SELECT	@intPermGenomeID, fldCode, fldLogical, fldLeft, fldRight, fldOrder, 
+					fldComparison, fldType
+				FROM Alg.tmpGene 
+				WHERE fldGenomeID = @intTempGenomeID;
+
+	INSERT INTO BE.tblCodon (
+				fldGeneID, fldCode, fldLeft, fldRight, fldOrder, fldArithmetic,
+				fldVariableID, fldValueID)
+		SELECT	P.fldID AS fldGeneID, 
+				C.fldCode, C.fldLeft, C.fldRight, C.fldOrder, C.fldArithmetic,
+				C.fldVariableID, C.fldValueID  
+			FROM Alg.tmpGene AS T
+			INNER JOIN Alg.tmpCodon AS C
+				ON T.fldID = C.fldGeneID 
+			INNER JOIN BE.tblGene AS P
+				ON T.fldCode = P.fldCode
+			WHERE T.fldGenomeID = @intTempGenomeID 
+				AND P.fldGenomeID = @intPermGenomeID
+
+	-- **** SCORE THE HIGHEST SCORING GENOME AND STORE THE RESULTS ********************************
+	-- First populate the local variables
+	SELECT @fltGenePenalty = (fldValue / 1000) FROM @tblAnalysis WHERE fldText = 'Gene Penalty';
+	SELECT @fltCodonPenalty = (fldValue / 1000) FROM @tblAnalysis WHERE fldText = 'Codon Penalty';
+	SELECT @bytGenes = COUNT(fldID) FROM Alg.tmpGene WHERE fldGenomeID = @intTempGenomeID;
+	SELECT @bytCodons = COUNT(G.fldID) 
+		FROM Alg.tmpGene AS G INNER JOIN Alg.tmpCodon AS C ON G.fldID = C.fldGeneID 
+		WHERE G.fldGenomeID = @intTempGenomeID;
+
+	-- Now call uspGenomeEvaluate to get the table of tallies, which is used below and 
+	-- stored in tblGenomeClassification
+	INSERT INTO @tblTally EXEC Alg.uspGenome_Evaluate  @intAnalysisID, @intTempGenomeID, @blnRandomPop;
+
+	INSERT INTO BE.tblGenomeClassification 
+		SELECT @intPermGenomeID, 1, fldTarget, fldPredictor, fldN 
+			FROM @tblTally; 
+
+	-- Next get the scores and stored them in tblGenomeScore.  
+	-- Note use of TRY/CATCH to capture errors (e.g. divide by zero) in the function.
+	BEGIN TRY
+		INSERT INTO BE.tblGenomeScore 
+			SELECT @intPermGenomeID, 1, fldPhi, fldRn, fldChiSq, fldChiP 
+				FROM  Alg.tvfGetGenomeScores(
+					@tblTally, 'Scoring', @bytGenes, @bytCodons, @fltGenePenalty, @fltCodonPenalty);
+	END TRY
+	BEGIN CATCH
+		INSERT INTO BE.tblGenomeScore VALUES( @intPermGenomeID, 1, 0, 0, 0, 0);
+	END CATCH;
+
+	-- Finally, evaluate the individual genes andd store them in tblGeneRecord.
+	EXEC Alg.uspGeneRecord_Insert  @intAnalysisID, @intPermGenomeID;
+
+END
+GO
+
